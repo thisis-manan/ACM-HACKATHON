@@ -25,5 +25,8 @@ export const api = {
   checkout: () => req('/checkout'),
   factoryReset: () => req('/factory-reset'),
   receipt: () => req('/receipt', 'GET'),
+  ledger: () => req('/ledger', 'GET'),
+  anchor: () => req('/anchor'),
+  consent: (scope, granted) => req(`/consent/${scope}/${granted ? 'grant' : 'revoke'}`),
   netinfo: () => req('/netinfo', 'GET'),
 };

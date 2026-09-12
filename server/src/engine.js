@@ -52,6 +52,7 @@ export class Engine {
   constructor() {
     this.broadcast = () => {};
     this.busy = false;
+    this.receipts = []; // operator's audit ledger — persists across stays/resets
     this.reset(true);
   }
 
@@ -74,6 +75,8 @@ export class Engine {
     this.guestState = null;                // plaintext source of truth (server-side)
     this.attestation = null;               // last attestation record
     this.attacksDefended = 0;
+    this.consent = { camera: false, storage: false }; // tenant-granted host access
+    this.consentLog = [];                  // audit of grant/revoke, embedded in receipt
     this.log = [];
 
     this.devices = DEVICE_DEFS.map((d) => ({
@@ -149,7 +152,7 @@ export class Engine {
 
       if (!attested) {
         this.attacksDefended += 1;
-        this.emit('attest', `🔴 ATTESTATION FAILED — hash not in trusted allowlist. Malicious software refused. Check-in aborted.`,
+        this.emit('attest', `ATTESTATION FAILED — hash not in trusted allowlist. Malicious software refused. Check-in aborted.`,
           'danger', { attestation: this.attestation });
         this.pushState();
         await sleep(400);
@@ -163,7 +166,7 @@ export class Engine {
         return { ok: false, attested: false, attestation: this.attestation };
       }
 
-      this.emit('attest', `🟢 ATTESTED — hub identity + trusted software verified. Guest may proceed.`, 'ok',
+      this.emit('attest', `ATTESTED — hub identity + trusted software verified. Guest may proceed.`, 'ok',
         { attestation: this.attestation });
       this.pushState();
       await sleep(600);
@@ -209,7 +212,7 @@ export class Engine {
     const actingId = pubHex(this.actorKey(actor).publicKey);
     if (d.boundTo !== actingId) {
       this.attacksDefended += 1;
-      this.emit('binding', `⛔ ${d.abstraction} rejected "${action}" — command not signed by the bound hub (${shortId(d.boundTo)}).`,
+      this.emit('binding', `${d.abstraction} rejected "${action}" — command not signed by the bound hub (${shortId(d.boundTo)}).`,
         'danger');
       this.pushState();
       return { ok: false, error: 'binding rejected' };
@@ -240,22 +243,36 @@ export class Engine {
       this.emit('sensor', 'Motion detected after dark.', 'info');
       if (rules.find((r) => r.id === 'r1')?.on) {
         light.state.on = true;
-        this.emit('rule', '⚙️ Rule r1 fired → LivingRoomLight ON', 'ok');
+        this.emit('rule', 'Rule r1 fired → LivingRoomLight ON', 'ok');
       }
     } else if (event === 'face-match') {
       cam.state.lastFace = this.guestState.faceProfile;
       this.emit('sensor', `Camera recognized: ${this.guestState.faceProfile}`, 'info');
       if (rules.find((r) => r.id === 'r2')?.on) {
         lock.state.locked = false;
-        this.emit('rule', '⚙️ Rule r2 fired → FrontDoorLock UNLOCKED', 'ok');
+        this.emit('rule', 'Rule r2 fired → FrontDoorLock UNLOCKED', 'ok');
       }
     } else if (event === 'face-stranger') {
       cam.state.lastFace = 'Unknown person';
       this.emit('sensor', 'Camera saw an unrecognized face.', 'info');
-      this.emit('rule', '🚫 No matching rule → door stays LOCKED. Access denied.', 'warn');
+      this.emit('rule', 'No matching rule → door stays LOCKED. Access denied.', 'warn');
     }
     this.pushState();
     return { ok: true };
+  }
+
+  // ---- tenant consent (scoped, revocable host access) --------------------
+  setConsent(scope, granted) {
+    if (this.controller !== 'GUEST') return { ok: false, error: 'no guest' };
+    if (!(scope in this.consent)) return { ok: false, error: 'bad scope' };
+    this.consent[scope] = !!granted;
+    const at = new Date().toISOString();
+    this.consentLog.push({ at, scope, granted: !!granted });
+    this.emit('consent', granted
+      ? `Tenant GRANTED the host scoped access to ${scope}. Logged & revocable.`
+      : `︎ Tenant REVOKED the host's access to ${scope}. Host is locked out again.`, granted ? 'warn' : 'ok');
+    this.pushState();
+    return { ok: true, consent: this.consent };
   }
 
   // ---- storage access (privacy) ------------------------------------------
@@ -264,10 +281,15 @@ export class Engine {
     if (as === 'GUEST' && this.controller === 'GUEST') {
       return { locked: false, plaintext: JSON.parse(aesDecrypt(this.guest.storageKey, this.storageBlob)) };
     }
-    // Owner (or anyone without the key) sees only ciphertext.
     if (as === 'OWNER' && this.controller === 'GUEST') {
+      if (this.consent.storage) {
+        // Tenant released a scoped, logged grant — host may read (still recorded).
+        this.emit('privacy', 'Host read guest data WITH tenant consent (grant is logged & revocable).', 'warn');
+        this.pushState();
+        return { locked: false, consented: true, plaintext: JSON.parse(aesDecrypt(this.guest.storageKey, this.storageBlob)) };
+      }
       this.attacksDefended += 1;
-      this.emit('privacy', '⛔ Owner tried to read guest storage — no key. Returns ciphertext only.', 'danger');
+      this.emit('privacy', 'Host tried to read guest storage without consent — no key. Ciphertext only.', 'danger');
       this.pushState();
     }
     return { locked: true, blob: this.storageBlob };
@@ -279,9 +301,14 @@ export class Engine {
       // Vacant space: the owner can view their own camera (the creepy hook).
       return { allowed: true, feed: 'owner-live' };
     }
+    if (as === 'OWNER' && this.consent.camera) {
+      this.emit('privacy', 'Host viewed the camera WITH tenant consent (grant is logged & revocable).', 'warn');
+      this.pushState();
+      return { allowed: true, consented: true, feed: 'consented-live' };
+    }
     if (as === 'OWNER') {
       this.attacksDefended += 1;
-      this.emit('privacy', '⛔ Owner requested the camera feed during the stay — DENIED. Camera answers only to the guest-bound hub.',
+      this.emit('privacy', 'Host requested the camera feed without consent — DENIED. Camera answers only to the guest-bound hub.',
         'danger');
       this.pushState();
       return { allowed: false };
@@ -317,7 +344,7 @@ export class Engine {
         state: { ...d.init }, boundTo: hubId,
       }));
       this.devices.forEach((d) => { d.cert = sign(this.ca.privateKey, pubHex(d.key.publicKey)); });
-      this.emit('attest', '🟢 Re-attested on Space B hub. Devices re-bound.', 'ok');
+      this.emit('attest', 'Re-attested on Space B hub. Devices re-bound.', 'ok');
       this.pushState();
       await sleep(500);
 
@@ -341,9 +368,12 @@ export class Engine {
     try {
       this.phase = 'CHECKING_OUT';
       this.emit('checkout', 'Guest checks out — space reset requested.', 'info');
-      // Snapshot a signed proof-of-privacy receipt BEFORE anything is destroyed.
-      this.lastReceipt = this.generateReceipt();
-      this.emit('receipt', '🧾 Signed Trust Receipt issued to the guest (verifiable proof of a private stay).', 'ok');
+      // Snapshot a signed proof-of-privacy receipt BEFORE anything is destroyed,
+      // and append it to the tamper-evident compliance ledger (hash-chained).
+      const prevHash = this.receipts.length ? this.receipts[this.receipts.length - 1].entryHash : 'genesis';
+      this.lastReceipt = this.generateReceipt(prevHash);
+      this.receipts.push(this.lastReceipt);
+      this.emit('receipt', 'Signed Trust Receipt appended to the compliance ledger (verifiable proof of a private stay).', 'ok');
       this.pushState();
       await sleep(600);
 
@@ -352,7 +382,7 @@ export class Engine {
       const deadBlob = this.storageBlob;
       const deadKey = this.guest.storageKey;
       this.guest = null; this.storageKey = null; this.guestState = null;
-      this.emit('shred', '🔥 Guest token + storage key destroyed. Encrypted data is now unrecoverable.', 'danger',
+      this.emit('shred', 'Guest token + storage key destroyed. Encrypted data is now unrecoverable.', 'danger',
         { blob: deadBlob });
       this.pushState();
       await sleep(700);
@@ -388,7 +418,7 @@ export class Engine {
   // ---- Trust Receipt (our extension beyond the paper) --------------------
   // A signed, verifiable audit log the guest keeps as proof their stay was
   // private: what software was attested, and every attack that was defeated.
-  generateReceipt() {
+  generateReceipt(prevHash = 'genesis') {
     const payload = {
       document: 'SpaceLord Trust Receipt',
       issuer: 'SpaceLord Manufacturer CA',
@@ -399,17 +429,39 @@ export class Engine {
         ? { stack: this.stack.name, stackHash: this.attestation.hash, attested: this.attestation.attested }
         : null,
       attacksDefended: this.attacksDefended,
+      consentGrants: this.consentLog.slice(),
       securityEvents: this.log
         .filter((e) => e.level === 'ok' || e.level === 'danger')
         .map((e) => ({ at: new Date(e.t).toISOString(), level: e.level, event: e.message })),
+      prevHash,
     };
     const body = JSON.stringify(payload);
+    // entryHash chains this receipt to the previous one (tamper-evident ledger).
+    const entryHash = sha256(prevHash + body);
     return {
       payload,
       algorithm: 'Ed25519',
       caPublicKey: this.ca.publicKey.export({ type: 'spki', format: 'pem' }),
       signature: sign(this.ca.privateKey, body),
+      entryHash,
+      prevHash,
     };
+  }
+
+  // ---- optional: anchor the ledger root to a public chain ----------------
+  // We do NOT store data on-chain. We publish only the ledger's root hash as a
+  // timestamped notarization — external proof the audit trail existed at time T.
+  // (Simulated here; in production this is one testnet transaction.)
+  anchorLedger() {
+    const root = this.receipts.length
+      ? sha256(this.receipts.map((e) => e.entryHash).join('|'))
+      : sha256('empty-ledger');
+    const at = new Date().toISOString();
+    const txid = '0x' + sha256(root + at).slice(0, 64);
+    this.lastAnchor = { root, txid, at, chain: 'Sepolia testnet (simulated)', entries: this.receipts.length };
+    this.emit('anchor', `Ledger root anchored (notarized) — root ${root.slice(0, 12)}… tx ${txid.slice(0, 12)}…`, 'ok');
+    this.pushState();
+    return this.lastAnchor;
   }
 
   // ---- sanitized state for the client ------------------------------------
@@ -443,6 +495,8 @@ export class Engine {
       })),
       hasStorage: !!this.storageBlob,
       hasReceipt: !!this.lastReceipt,
+      consent: { ...this.consent },
+      ledgerCount: this.receipts.length,
       rules: this.guestState ? this.guestState.rules : [],
       log: this.log.slice(-60),
     };

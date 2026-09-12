@@ -72,6 +72,14 @@ app.get('/api/receipt', (_req, res) => {
   res.json({ error: 'No stay to certify yet — check in first.' });
 });
 
+app.get('/api/ledger', (_req, res) => res.json({ entries: engine.receipts, anchor: engine.lastAnchor || null }));
+
+app.post('/api/anchor', (_req, res) => res.json(engine.anchorLedger()));
+
+app.post('/api/consent/:scope/:granted', (req, res) => {
+  res.json(engine.setConsent(req.params.scope, req.params.granted === 'grant'));
+});
+
 app.get('/api/netinfo', (_req, res) => res.json({ ip: lanIp(), clientPort: 5173 }));
 
 server.listen(PORT, () => {
